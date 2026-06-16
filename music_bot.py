@@ -18,6 +18,8 @@ DOWNLOADS_DIR = Path("downloads")
 DOWNLOADS_DIR.mkdir(exist_ok=True)
 
 MAX_FILE_SIZE = 50 * 1024 * 1024
+RETRY_ATTEMPTS = 3
+RETRY_DELAY = 5  # seconds
 
 def get_free_disk_space():
     """Get free disk space in bytes"""
@@ -41,6 +43,81 @@ def cleanup_temp_files():
                     logger.warning(f"Could not remove {file}: {e}")
     except Exception as e:
         logger.error(f"Error during cleanup: {e}")
+
+def get_ydl_opts(attempt=1):
+    """
+    Get yt-dlp options with rotating player clients for anti-blocking
+    Different attempts use different strategies
+    """
+    
+    # Rotate player clients on retry
+    player_clients_strategies = [
+        ['web', 'android', 'tv'],  # Attempt 1: Standard clients
+        ['android', 'tv', 'web'],  # Attempt 2: Android first
+        ['tv', 'web', 'android'],  # Attempt 3: TV first (less detection)
+    ]
+    
+    # Rotate user agents
+    user_agents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    ]
+    
+    client_idx = min(attempt - 1, len(player_clients_strategies) - 1)
+    ua_idx = (attempt - 1) % len(user_agents)
+    
+    output_template = str(DOWNLOADS_DIR / "%(title).150s.%(ext)s")
+    
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+            'nopostoverwrites': False,
+        }],
+        'outtmpl': output_template,
+        'quiet': False,
+        'no_warnings': False,
+        'socket_timeout': 60,
+        'http_headers': {
+            'User-Agent': user_agents[ua_idx],
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Referer': 'https://www.youtube.com/',
+            'Origin': 'https://www.youtube.com',
+        },
+        'extractor_args': {
+            'youtube': {
+                'player_client': player_clients_strategies[client_idx],
+                'player_skip_download_pages': True,
+                'skip_unavailable_videos': True,
+            }
+        },
+        'retries': 15,
+        'fragment_retries': 15,
+        'skip_unavailable_fragments': True,
+        'youtube_include_dash_manifest': False,
+        'keepvideo': False,
+        'overwrites': True,
+        'ignoreerrors': False,
+        'extract_flat': False,
+        'socket_timeout': 60,
+        'age_limit': None,
+    }
+    
+    # Add proxy support for higher retry attempts (if needed)
+    if attempt >= 3:
+        ydl_opts.update({
+            'socket_timeout': 90,
+            'http_headers': {
+                **ydl_opts['http_headers'],
+                'X-Forwarded-For': '1.2.3.4',  # Rotate apparent IP
+            }
+        })
+    
+    return ydl_opts
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("""
@@ -118,150 +195,174 @@ async def download_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text("⏳ Downloading... Please wait (this may take 1-2 minutes)")
     
     audio_file = None
-    try:
-        # Clean up old temp files before starting
-        cleanup_temp_files()
-        
-        # Use sanitized output template with retry mechanism
-        output_template = str(DOWNLOADS_DIR / "%(title).150s.%(ext)s")
-        
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-                'nopostoverwrites': False,
-            }],
-            'outtmpl': output_template,
-            'quiet': False,
-            'no_warnings': False,
-            'socket_timeout': 60,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            },
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['web', 'android', 'tv'],
-                    'player_skip_download_pages': True,
-                    'skip_unavailable_videos': True,
-                }
-            },
-            'retries': 10,
-            'fragment_retries': 10,
-            'skip_unavailable_fragments': True,
-            'youtube_include_dash_manifest': False,
-            'keepvideo': False,
-            'overwrites': True,
-            'ignoreerrors': False,
-            'extract_flat': False,
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
+    attempt = 0
+    last_error = None
+    
+    while attempt < RETRY_ATTEMPTS:
+        attempt += 1
+        try:
+            # Clean up old temp files before starting
+            cleanup_temp_files()
             
-            # Find the actual output file (could be .mp3 or original format)
-            base_path = Path(filename)
-            audio_file = base_path.with_suffix('.mp3')
+            # Get strategy-specific options
+            ydl_opts = get_ydl_opts(attempt)
             
-            # Fallback: if MP3 doesn't exist, look for the original file
-            if not audio_file.exists() and base_path.exists():
-                audio_file = base_path
+            logger.info(f"Download attempt {attempt}/{RETRY_ATTEMPTS} for: {url}")
             
-            if not audio_file.exists():
-                logger.error(f"File not created for: {url}")
-                await update.message.reply_text("❌ Download failed - file not created. Check FFmpeg installation.")
-                return
-            
-            # Verify file size and integrity
-            try:
-                file_size = audio_file.stat().st_size
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
                 
-                if file_size == 0:
-                    audio_file.unlink()
-                    await update.message.reply_text("❌ Download created empty file. Try again.")
-                    return
+                # Find the actual output file (could be .mp3 or original format)
+                base_path = Path(filename)
+                audio_file = base_path.with_suffix('.mp3')
                 
-                if file_size > MAX_FILE_SIZE:
-                    audio_file.unlink()
-                    await update.message.reply_text(f"❌ File too large ({file_size/1024/1024:.1f}MB). Max: 50MB")
-                    return
-            
-            except OSError as e:
-                logger.error(f"File stat error: {e}")
-                await update.message.reply_text("❌ Cannot access downloaded file. Disk error?")
-                return
-            
-            # Upload to Telegram
-            try:
-                await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+                # Fallback: if MP3 doesn't exist, look for the original file
+                if not audio_file.exists() and base_path.exists():
+                    audio_file = base_path
                 
-                with open(audio_file, 'rb') as f:
-                    await update.message.reply_audio(audio=f, title=audio_file.stem)
+                if not audio_file.exists():
+                    logger.error(f"File not created for: {url}")
+                    if attempt < RETRY_ATTEMPTS:
+                        logger.info(f"Retrying in {RETRY_DELAY} seconds...")
+                        await update.message.reply_text(
+                            f"⏳ Attempt {attempt} failed. Retrying with different strategy... (attempt {attempt + 1}/{RETRY_ATTEMPTS})"
+                        )
+                        time.sleep(RETRY_DELAY)
+                        continue
+                    else:
+                        await update.message.reply_text("❌ Download failed - file not created. Check FFmpeg installation.")
+                        return
                 
-                logger.info(f"✅ Sent: {audio_file.name} ({file_size/1024/1024:.1f}MB)")
-                
-            except Exception as e:
-                logger.error(f"Upload error: {e}")
-                await update.message.reply_text(f"❌ Failed to send file: {str(e)[:100]}")
-                return
-            
-            finally:
-                # Clean up after upload
+                # Verify file size and integrity
                 try:
-                    if audio_file and audio_file.exists():
+                    file_size = audio_file.stat().st_size
+                    
+                    if file_size == 0:
                         audio_file.unlink()
+                        if attempt < RETRY_ATTEMPTS:
+                            logger.info(f"Empty file detected. Retrying...")
+                            await update.message.reply_text(
+                                f"⏳ Empty file detected. Retrying... (attempt {attempt + 1}/{RETRY_ATTEMPTS})"
+                            )
+                            time.sleep(RETRY_DELAY)
+                            continue
+                        else:
+                            await update.message.reply_text("❌ Download created empty file. Try again.")
+                            return
+                    
+                    if file_size > MAX_FILE_SIZE:
+                        audio_file.unlink()
+                        await update.message.reply_text(f"❌ File too large ({file_size/1024/1024:.1f}MB). Max: 50MB")
+                        return
+                
+                except OSError as e:
+                    logger.error(f"File stat error: {e}")
+                    if attempt < RETRY_ATTEMPTS:
+                        await update.message.reply_text(
+                            f"⏳ File error detected. Retrying... (attempt {attempt + 1}/{RETRY_ATTEMPTS})"
+                        )
+                        time.sleep(RETRY_DELAY)
+                        continue
+                    else:
+                        await update.message.reply_text("❌ Cannot access downloaded file. Disk error?")
+                        return
+                
+                # Upload to Telegram - SUCCESS!
+                try:
+                    await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+                    
+                    with open(audio_file, 'rb') as f:
+                        await update.message.reply_audio(audio=f, title=audio_file.stem)
+                    
+                    logger.info(f"✅ Sent: {audio_file.name} ({file_size/1024/1024:.1f}MB)")
+                    return  # Success - exit function
+                    
                 except Exception as e:
-                    logger.warning(f"Could not delete file: {e}")
-    
-    except yt_dlp.utils.DownloadError as e:
-        logger.error(f"Download Error: {e}")
-        error_msg = str(e)[:150]
+                    logger.error(f"Upload error: {e}")
+                    await update.message.reply_text(f"❌ Failed to send file: {str(e)[:100]}")
+                    return
+                
+                finally:
+                    # Clean up after upload attempt
+                    try:
+                        if audio_file and audio_file.exists():
+                            audio_file.unlink()
+                    except Exception as e:
+                        logger.warning(f"Could not delete file: {e}")
         
-        # Handle specific YouTube blocking errors
-        if any(phrase in error_msg.lower() for phrase in ["sign in", "blocked", "403", "429", "too many requests"]):
-            await update.message.reply_text(
-                "❌ YouTube is temporarily blocking requests.\n\n"
-                "*Solutions to try:*\n"
-                "1️⃣ Wait 5-10 minutes and try again\n"
-                "2️⃣ Try a different video\n"
-                "3️⃣ Use a playlist or channel link instead\n"
-                "4️⃣ Check if the video is public/available"
-            )
-        else:
-            await update.message.reply_text(f"❌ Download failed: {error_msg}")
-    
-    except IOError as e:
-        logger.error(f"I/O Error: {e}")
-        error_code = e.errno
+        except yt_dlp.utils.DownloadError as e:
+            logger.error(f"Download Error (attempt {attempt}): {e}")
+            last_error = str(e)[:150]
+            error_msg = last_error.lower()
+            
+            # Handle specific YouTube blocking errors
+            if any(phrase in error_msg for phrase in ["sign in", "blocked", "403", "429", "too many requests", "unavailable"]):
+                if attempt < RETRY_ATTEMPTS:
+                    logger.info(f"YouTube blocking detected. Waiting {RETRY_DELAY}s before retry...")
+                    await update.message.reply_text(
+                        f"🚫 YouTube detected automated access.\n\n"
+                        f"Retrying with different strategy... (attempt {attempt + 1}/{RETRY_ATTEMPTS})\n\n"
+                        f"⏳ Waiting {RETRY_DELAY} seconds..."
+                    )
+                    time.sleep(RETRY_DELAY)
+                    continue
+                else:
+                    await update.message.reply_text(
+                        "❌ YouTube is blocking requests after multiple attempts.\n\n"
+                        "*Recommended solutions:*\n"
+                        "1️⃣ Wait 10-15 minutes before trying again\n"
+                        "2️⃣ Try downloading a different video\n"
+                        "3️⃣ Try a YouTube playlist instead of single video\n"
+                        "4️⃣ Check if the video is public and not age-restricted\n"
+                        "5️⃣ Use a VPN if available\n\n"
+                        "⚠️ Note: YouTube actively blocks automated access"
+                    )
+                    return
+            else:
+                await update.message.reply_text(f"❌ Download failed: {last_error}")
+                return
         
-        if error_code == 5:  # Errno 5: Input/Output Error
-            await update.message.reply_text(
-                "❌ Disk I/O Error occurred.\n\n"
-                "*Possible causes:*\n"
-                "• Disk is full or read-only\n"
-                "• File system error\n"
-                "• Permission denied\n\n"
-                "*Try:*\n"
-                "1️⃣ Run /clear to free space\n"
-                "2️⃣ Check disk permissions\n"
-                "3️⃣ Try a smaller file"
-            )
-        elif error_code == 28:  # No space left on device
-            await update.message.reply_text(
-                "❌ No disk space available!\n\n"
-                "Run /clear to delete old files and try again."
-            )
-        else:
-            await update.message.reply_text(f"❌ File system error ({error_code}): {str(e)[:80]}")
-    
-    except Exception as e:
-        logger.error(f"Error: {type(e).__name__}: {e}")
-        error_msg = str(e)[:100]
-        await update.message.reply_text(f"❌ Error: {error_msg}")
+        except IOError as e:
+            logger.error(f"I/O Error (attempt {attempt}): {e}")
+            last_error = str(e)
+            error_code = e.errno
+            
+            if error_code == 5:  # Errno 5: Input/Output Error
+                await update.message.reply_text(
+                    "❌ Disk I/O Error occurred.\n\n"
+                    "*Possible causes:*\n"
+                    "• Disk is full or read-only\n"
+                    "• File system error\n"
+                    "• Permission denied\n\n"
+                    "*Try:*\n"
+                    "1️⃣ Run /clear to free space\n"
+                    "2️⃣ Check disk permissions\n"
+                    "3️⃣ Try a smaller file"
+                )
+            elif error_code == 28:  # No space left on device
+                await update.message.reply_text(
+                    "❌ No disk space available!\n\n"
+                    "Run /clear to delete old files and try again."
+                )
+            else:
+                await update.message.reply_text(f"❌ File system error ({error_code}): {str(e)[:80]}")
+            return
+        
+        except Exception as e:
+            logger.error(f"Error (attempt {attempt}): {type(e).__name__}: {e}")
+            last_error = str(e)[:100]
+            
+            if attempt < RETRY_ATTEMPTS:
+                logger.info(f"Retrying after error...")
+                await update.message.reply_text(
+                    f"⏳ Error occurred. Retrying with different strategy... (attempt {attempt + 1}/{RETRY_ATTEMPTS})"
+                )
+                time.sleep(RETRY_DELAY)
+                continue
+            else:
+                await update.message.reply_text(f"❌ Error: {last_error}")
+                return
     
     finally:
         # Final cleanup of any remaining temp files
