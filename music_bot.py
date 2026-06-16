@@ -4,6 +4,8 @@
 import logging
 import yt_dlp
 import time
+import os
+import shutil
 from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -16,6 +18,29 @@ DOWNLOADS_DIR = Path("downloads")
 DOWNLOADS_DIR.mkdir(exist_ok=True)
 
 MAX_FILE_SIZE = 50 * 1024 * 1024
+
+def get_free_disk_space():
+    """Get free disk space in bytes"""
+    try:
+        stat = shutil.disk_usage(DOWNLOADS_DIR)
+        return stat.free
+    except Exception as e:
+        logger.error(f"Could not check disk space: {e}")
+        return None
+
+def cleanup_temp_files():
+    """Clean up incomplete/temporary downloads"""
+    try:
+        temp_patterns = ['*.part', '*.f*', '*.tmp', '*.ytdl']
+        for pattern in temp_patterns:
+            for file in DOWNLOADS_DIR.glob(pattern):
+                try:
+                    file.unlink()
+                    logger.info(f"Cleaned up: {file.name}")
+                except Exception as e:
+                    logger.warning(f"Could not remove {file}: {e}")
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("""
@@ -59,8 +84,14 @@ async def clear_downloads(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         count = 0
         for file in DOWNLOADS_DIR.glob("*"):
             if file.is_file():
-                file.unlink()
-                count += 1
+                try:
+                    file.unlink()
+                    count += 1
+                except Exception as e:
+                    logger.warning(f"Could not delete {file}: {e}")
+        
+        # Also clean temporary files
+        cleanup_temp_files()
         await update.message.reply_text(f"✅ Cleared {count} files!")
     except Exception as e:
         logger.error(f"Error clearing files: {e}")
@@ -73,11 +104,26 @@ async def download_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("❌ Please send a valid link")
         return
     
+    # Check disk space before starting
+    free_space = get_free_disk_space()
+    if free_space and free_space < 200 * 1024 * 1024:  # Less than 200MB
+        await update.message.reply_text(
+            "❌ Not enough disk space!\n\n"
+            f"Available: {free_space/1024/1024:.1f}MB\n"
+            "Required: ~200MB minimum"
+        )
+        return
+    
     await update.message.chat.send_action(ChatAction.TYPING)
     await update.message.reply_text("⏳ Downloading... Please wait (this may take 1-2 minutes)")
     
+    audio_file = None
     try:
-        output_template = str(DOWNLOADS_DIR / "%(title)s.%(ext)s")
+        # Clean up old temp files before starting
+        cleanup_temp_files()
+        
+        # Use sanitized output template with retry mechanism
+        output_template = str(DOWNLOADS_DIR / "%(title).150s.%(ext)s")
         
         ydl_opts = {
             'format': 'bestaudio/best',
@@ -85,10 +131,12 @@ async def download_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
                 'preferredquality': '192',
+                'nopostoverwrites': False,
             }],
             'outtmpl': output_template,
             'quiet': False,
-            'socket_timeout': 30,
+            'no_warnings': False,
+            'socket_timeout': 60,
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept-Language': 'en-US,en;q=0.9',
@@ -101,45 +149,80 @@ async def download_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     'skip_unavailable_videos': True,
                 }
             },
-            'socket_timeout': 30,
             'retries': 10,
             'fragment_retries': 10,
             'skip_unavailable_fragments': True,
             'youtube_include_dash_manifest': False,
-            'quiet': False,
-            'no_warnings': False,
+            'keepvideo': False,
+            'overwrites': True,
+            'ignoreerrors': False,
+            'extract_flat': False,
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
-            audio_file = Path(filename).with_suffix('.mp3')
+            
+            # Find the actual output file (could be .mp3 or original format)
+            base_path = Path(filename)
+            audio_file = base_path.with_suffix('.mp3')
+            
+            # Fallback: if MP3 doesn't exist, look for the original file
+            if not audio_file.exists() and base_path.exists():
+                audio_file = base_path
             
             if not audio_file.exists():
-                await update.message.reply_text("❌ Download failed - file not created")
+                logger.error(f"File not created for: {url}")
+                await update.message.reply_text("❌ Download failed - file not created. Check FFmpeg installation.")
                 return
             
-            file_size = audio_file.stat().st_size
+            # Verify file size and integrity
+            try:
+                file_size = audio_file.stat().st_size
+                
+                if file_size == 0:
+                    audio_file.unlink()
+                    await update.message.reply_text("❌ Download created empty file. Try again.")
+                    return
+                
+                if file_size > MAX_FILE_SIZE:
+                    audio_file.unlink()
+                    await update.message.reply_text(f"❌ File too large ({file_size/1024/1024:.1f}MB). Max: 50MB")
+                    return
             
-            if file_size > MAX_FILE_SIZE:
-                audio_file.unlink()
-                await update.message.reply_text(f"❌ File too large ({file_size/1024/1024:.1f}MB). Max: 50MB")
+            except OSError as e:
+                logger.error(f"File stat error: {e}")
+                await update.message.reply_text("❌ Cannot access downloaded file. Disk error?")
                 return
             
-            await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+            # Upload to Telegram
+            try:
+                await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+                
+                with open(audio_file, 'rb') as f:
+                    await update.message.reply_audio(audio=f, title=audio_file.stem)
+                
+                logger.info(f"✅ Sent: {audio_file.name} ({file_size/1024/1024:.1f}MB)")
+                
+            except Exception as e:
+                logger.error(f"Upload error: {e}")
+                await update.message.reply_text(f"❌ Failed to send file: {str(e)[:100]}")
+                return
             
-            with open(audio_file, 'rb') as f:
-                await update.message.reply_audio(audio=f, title=audio_file.stem)
-            
-            logger.info(f"✅ Sent: {audio_file.name}")
-            audio_file.unlink()
-            
+            finally:
+                # Clean up after upload
+                try:
+                    if audio_file and audio_file.exists():
+                        audio_file.unlink()
+                except Exception as e:
+                    logger.warning(f"Could not delete file: {e}")
+    
     except yt_dlp.utils.DownloadError as e:
         logger.error(f"Download Error: {e}")
         error_msg = str(e)[:150]
         
         # Handle specific YouTube blocking errors
-        if any(phrase in error_msg for phrase in ["Sign in to confirm", "blocked", "403", "429", "too many requests"]):
+        if any(phrase in error_msg.lower() for phrase in ["sign in", "blocked", "403", "429", "too many requests"]):
             await update.message.reply_text(
                 "❌ YouTube is temporarily blocking requests.\n\n"
                 "*Solutions to try:*\n"
@@ -151,10 +234,38 @@ async def download_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else:
             await update.message.reply_text(f"❌ Download failed: {error_msg}")
     
+    except IOError as e:
+        logger.error(f"I/O Error: {e}")
+        error_code = e.errno
+        
+        if error_code == 5:  # Errno 5: Input/Output Error
+            await update.message.reply_text(
+                "❌ Disk I/O Error occurred.\n\n"
+                "*Possible causes:*\n"
+                "• Disk is full or read-only\n"
+                "• File system error\n"
+                "• Permission denied\n\n"
+                "*Try:*\n"
+                "1️⃣ Run /clear to free space\n"
+                "2️⃣ Check disk permissions\n"
+                "3️⃣ Try a smaller file"
+            )
+        elif error_code == 28:  # No space left on device
+            await update.message.reply_text(
+                "❌ No disk space available!\n\n"
+                "Run /clear to delete old files and try again."
+            )
+        else:
+            await update.message.reply_text(f"❌ File system error ({error_code}): {str(e)[:80]}")
+    
     except Exception as e:
-        logger.error(f"Error: {e}")
-        error_msg = str(e)[:150]
+        logger.error(f"Error: {type(e).__name__}: {e}")
+        error_msg = str(e)[:100]
         await update.message.reply_text(f"❌ Error: {error_msg}")
+    
+    finally:
+        # Final cleanup of any remaining temp files
+        cleanup_temp_files()
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(f"Update {update} caused error {context.error}")
