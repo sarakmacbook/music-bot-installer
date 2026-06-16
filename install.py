@@ -373,6 +373,8 @@ call venv\\Scripts\\activate.bat
 python music_bot.py
 pause
 """
+            with open(script_path, 'w') as f:
+                f.write(script_content)
         else:
             script_path = self.project_dir / "run.sh"
             script_content = """#!/bin/bash
@@ -380,11 +382,12 @@ cd "$(dirname "$0")"
 source venv/bin/activate
 python3 music_bot.py
 """
+            with open(script_path, 'w') as f:
+                f.write(script_content)
+            # Set executable permissions AFTER writing the file
             os.chmod(script_path, 0o755)
         
-        with open(script_path, 'w') as f:
-            f.write(script_content)
-        
+        print(f"✓ Created startup script: {script_path.name}")
         return script_path
     
     def print_completion(self):
@@ -455,8 +458,15 @@ python3 music_bot.py
         self.install_dependencies(venv_python)
         
         # Create startup script
+        print("="*60)
+        print("📝 CREATING STARTUP SCRIPT")
+        print("="*60 + "\n")
         if venv_dir:
-            self.create_startup_script(venv_dir)
+            try:
+                self.create_startup_script(venv_dir)
+                print("✅ Startup script created successfully\n")
+            except Exception as e:
+                print(f"⚠️  Warning: Could not create startup script: {e}\n")
         
         # Show completion message
         self.print_completion()
@@ -471,4 +481,6 @@ if __name__ == "__main__":
         sys.exit(1)
     except Exception as e:
         print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
