@@ -2,6 +2,7 @@
 """
 Telegram Music Bot - One Click Installer
 Interactive setup script for Linux, macOS, and Windows
+Fixes PEP 668 externally-managed-environment error by using virtual environment
 """
 
 import os
@@ -109,7 +110,31 @@ class MusicBotInstaller:
         
         response = input("\n⏳ Press Enter when done, or Ctrl+C to exit: ")
     
-    def install_dependencies(self):
+    def create_virtual_env(self):
+        """Create and activate virtual environment"""
+        print("✓ Setting up virtual environment...")
+        venv_dir = self.project_dir / "venv"
+        
+        # Create virtual environment
+        result = subprocess.run([sys.executable, "-m", "venv", str(venv_dir)],
+                              capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            print(f"❌ Failed to create virtual environment")
+            print(f"Error: {result.stderr}")
+            return None
+        
+        print("✅ Virtual environment created\n")
+        return venv_dir
+    
+    def get_venv_python(self, venv_dir):
+        """Get the Python executable in the virtual environment"""
+        if self.os_type == "Windows":
+            return venv_dir / "Scripts" / "python.exe"
+        else:
+            return venv_dir / "bin" / "python"
+    
+    def install_dependencies(self, venv_python=None):
         """Install Python dependencies"""
         print("="*60)
         print("📦 INSTALLING PYTHON DEPENDENCIES")
@@ -122,8 +147,26 @@ class MusicBotInstaller:
             self.create_requirements_file()
         
         print("Installing packages...")
+        
+        # Use venv python if available, otherwise use system python
+        if venv_python:
+            python_exe = str(venv_python)
+        else:
+            python_exe = sys.executable
+        
+        # Upgrade pip first
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"],
+            [python_exe, "-m", "pip", "install", "--upgrade", "pip"],
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode != 0:
+            print(f"⚠️  Warning: Could not upgrade pip")
+        
+        # Install requirements
+        result = subprocess.run(
+            [python_exe, "-m", "pip", "install", "-r", "requirements.txt"],
             capture_output=False
         )
         
@@ -320,13 +363,46 @@ if __name__ == '__main__':
         downloads_dir.mkdir(exist_ok=True)
         print("✅ Directories ready\n")
     
+    def create_startup_script(self, venv_dir):
+        """Create startup script for easy bot launching"""
+        if self.os_type == "Windows":
+            script_path = self.project_dir / "run.bat"
+            script_content = """@echo off
+cd /d "%~dp0"
+call venv\\Scripts\\activate.bat
+python music_bot.py
+pause
+"""
+        else:
+            script_path = self.project_dir / "run.sh"
+            script_content = """#!/bin/bash
+cd "$(dirname "$0")"
+source venv/bin/activate
+python3 music_bot.py
+"""
+            os.chmod(script_path, 0o755)
+        
+        with open(script_path, 'w') as f:
+            f.write(script_content)
+        
+        return script_path
+    
     def print_completion(self):
         """Print completion message"""
         print("\n" + "="*60)
         print("✅ INSTALLATION COMPLETE!")
         print("="*60)
         print("\n🚀 TO START YOUR BOT:\n")
-        print("   python3 music_bot.py\n")
+        
+        if self.os_type == "Windows":
+            print("   Option 1: Double-click run.bat")
+            print("   Option 2: Run in terminal:")
+            print("     venv\\Scripts\\activate.bat && python music_bot.py\n")
+        else:
+            print("   Option 1: ./run.sh")
+            print("   Option 2: Run in terminal:")
+            print("     source venv/bin/activate && python3 music_bot.py\n")
+        
         print("="*60)
         print("📝 IMPORTANT:")
         print("  • Keep token.txt safe - never share it")
@@ -364,12 +440,23 @@ if __name__ == '__main__':
         if not ffmpeg_ok:
             print("⚠️  Continuing without FFmpeg (may cause issues)\n")
         
+        # Create virtual environment
+        print("="*60)
+        print("🐍 SETTING UP PYTHON VIRTUAL ENVIRONMENT")
+        print("="*60 + "\n")
+        venv_dir = self.create_virtual_env()
+        venv_python = self.get_venv_python(venv_dir) if venv_dir else None
+        
         # Create bot files
         self.create_bot_file()
         self.create_directories()
         
-        # Install dependencies
-        self.install_dependencies()
+        # Install dependencies in virtual environment
+        self.install_dependencies(venv_python)
+        
+        # Create startup script
+        if venv_dir:
+            self.create_startup_script(venv_dir)
         
         # Show completion message
         self.print_completion()
