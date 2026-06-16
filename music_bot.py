@@ -3,10 +3,7 @@
 
 import logging
 import yt_dlp
-import time
-import os
 import shutil
-import subprocess
 from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -44,7 +41,7 @@ def cleanup_temp_files():
         logger.error(f"Error during cleanup: {e}")
 
 def get_ydl_opts():
-    """Get optimized yt-dlp options to avoid YouTube blocking"""
+    """Get optimized yt-dlp options for YouTube downloads"""
     
     output_template = str(DOWNLOADS_DIR / "%(title).150s.%(ext)s")
     
@@ -61,38 +58,30 @@ def get_ydl_opts():
         'no_warnings': False,
         'socket_timeout': 120,
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept-Language': 'en-US,en;q=0.9',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Referer': 'https://www.youtube.com/',
-            'Origin': 'https://www.youtube.com',
         },
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'tv'],
+                'player_client': ['android'],
                 'player_skip_download_pages': True,
-                'skip_unavailable_videos': True,
-                'innertube_client_version': '2.20240101.00.00',
             }
         },
-        'retries': 20,
-        'fragment_retries': 20,
+        'retries': 25,
+        'fragment_retries': 25,
         'skip_unavailable_fragments': True,
         'youtube_include_dash_manifest': False,
-        'youtube_include_hls_manifest': False,
         'keepvideo': False,
         'overwrites': True,
-        'ignoreerrors': False,
-        'extract_flat': False,
-        'age_limit': None,
-        'quiet': False,
-        'no_warnings': False,
-        'progress_hooks': [],
+        'socket_timeout': 120,
         'http_chunk_size': 10485760,
         'concurrent_fragment_downloads': 4,
-        'socket_timeout': 120,
-        'connection_timeout': 120,
-        'read_timeout': 120,
+        'progress_hooks': [],
+        'verbose': False,
+        'quiet': True,
+        'no_warnings': True,
     }
     
     return ydl_opts
@@ -186,12 +175,13 @@ async def download_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             base_path = Path(filename)
             audio_file = base_path.with_suffix('.mp3')
             
+            # Fallback: if MP3 doesn't exist, check for original file
             if not audio_file.exists() and base_path.exists():
                 audio_file = base_path
             
             if not audio_file.exists():
                 logger.error(f"File not created for: {url}")
-                await update.message.reply_text("❌ Download failed - file not created. Check FFmpeg installation.")
+                await update.message.reply_text("❌ Download failed - file not created.\n\nMake sure FFmpeg is installed:\n`sudo apt-get install ffmpeg`")
                 return
             
             try:
@@ -199,7 +189,7 @@ async def download_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 
                 if file_size == 0:
                     audio_file.unlink()
-                    await update.message.reply_text("❌ Download created empty file. Try again.")
+                    await update.message.reply_text("❌ Downloaded file is empty. Try a different video.")
                     return
                 
                 if file_size > MAX_FILE_SIZE:
@@ -209,7 +199,7 @@ async def download_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             
             except OSError as e:
                 logger.error(f"File stat error: {e}")
-                await update.message.reply_text("❌ Cannot access downloaded file. Disk error?")
+                await update.message.reply_text("❌ Cannot access file. Disk error?")
                 return
             
             # Upload to Telegram
@@ -223,7 +213,7 @@ async def download_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 
             except Exception as e:
                 logger.error(f"Upload error: {e}")
-                await update.message.reply_text(f"❌ Failed to send file: {str(e)[:100]}")
+                await update.message.reply_text(f"❌ Failed to send: {str(e)[:80]}")
             
             finally:
                 try:
@@ -234,27 +224,25 @@ async def download_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     except yt_dlp.utils.DownloadError as e:
         logger.error(f"Download Error: {e}")
-        error_msg = str(e)[:200]
-        await update.message.reply_text(f"❌ Download failed:\n{error_msg}")
-    
-    except IOError as e:
-        logger.error(f"I/O Error: {e}")
-        error_code = e.errno
+        error_msg = str(e)
         
-        if error_code == 5:
+        # Check for websockets error
+        if "websockets" in error_msg.lower():
             await update.message.reply_text(
-                "❌ Disk I/O Error occurred.\n\n"
-                "1️⃣ Run /clear to free space\n"
-                "2️⃣ Check disk permissions\n"
-                "3️⃣ Try a smaller file"
+                "❌ Missing websockets library.\n\n"
+                "Fix: Run installer again\n"
+                "`python3 install.py`\n\n"
+                "Or install manually:\n"
+                "`pip install websockets`"
             )
-        elif error_code == 28:
+        elif "unsupported url scheme" in error_msg.lower():
             await update.message.reply_text(
-                "❌ No disk space available!\n\n"
-                "Run /clear to delete old files and try again."
+                "❌ URL scheme error - missing dependencies.\n\n"
+                "Fix: Run installer again\n"
+                "`python3 install.py`"
             )
         else:
-            await update.message.reply_text(f"❌ File system error ({error_code})")
+            await update.message.reply_text(f"❌ Download failed:\n{error_msg[:150]}")
     
     except Exception as e:
         logger.error(f"Error: {type(e).__name__}: {e}")
